@@ -53,6 +53,7 @@
 #include "memattr.h"
 #include "ada-lang.h"
 #include "top.h"
+#include "ui.h"
 #include "valprint.h"
 #include "jit.h"
 #include "parser-defs.h"
@@ -68,6 +69,7 @@
 #include "tid-parse.h"
 #include "cli/cli-style.h"
 #include "cli/cli-decode.h"
+#include <unordered_set>
 
 /* readline include files */
 #include "readline/tilde.h"
@@ -609,15 +611,6 @@ static int overlay_events_enabled;
 
 /* See description in breakpoint.h. */
 bool target_exact_watchpoints = false;
-
-/* Walk the following statement or block through all breakpoints.
-   ALL_BREAKPOINTS_SAFE does so even if the statement deletes the
-   current breakpoint.  */
-
-#define ALL_BREAKPOINTS_SAFE(B,TMP)	\
-	for (B = breakpoint_chain;	\
-	     B ? (TMP=B->next, 1): 0;	\
-	     B = TMP)
 
 /* Chains of all breakpoints defined.  */
 
@@ -1454,12 +1447,16 @@ breakpoint_set_silent (struct breakpoint *b, int silent)
     gdb::observers::breakpoint_modified.notify (b);
 }
 
-/* Set the thread for this breakpoint.  If THREAD is -1, make the
-   breakpoint work for any thread.  */
+/* See breakpoint.h.  */
 
 void
 breakpoint_set_thread (struct breakpoint *b, int thread)
 {
+  /* It is invalid to set the thread field to anything other than -1 (which
+     means no thread restriction) if a task restriction is already in
+     place.  */
+  gdb_assert (thread == -1 || b->task == -1);
+
   int old_thread = b->thread;
 
   b->thread = thread;
@@ -1467,12 +1464,16 @@ breakpoint_set_thread (struct breakpoint *b, int thread)
     gdb::observers::breakpoint_modified.notify (b);
 }
 
-/* Set the task for this breakpoint.  If TASK is 0, make the
-   breakpoint work for any task.  */
+/* See breakpoint.h.  */
 
 void
 breakpoint_set_task (struct breakpoint *b, int task)
 {
+  /* It is invalid to set the task field to anything other than -1 (which
+     means no task restriction) if a thread restriction is already in
+     place.  */
+  gdb_assert (task == -1 || b->thread == -1);
+
   int old_task = b->task;
 
   b->task = task;
@@ -1843,6 +1844,7 @@ watchpoint_del_at_next_stop (struct watchpoint *w)
       w->related_breakpoint = w;
     }
   w->disposition = disp_del_at_next_stop;
+  disable_breakpoint (w);
 }
 
 /* Extract a bitfield value from value VAL using the bit parameters contained in
@@ -1856,14 +1858,13 @@ extract_bitfield_from_watchpoint_value (struct watchpoint *w, struct value *val)
   if (val == NULL)
     return NULL;
 
-  bit_val = allocate_value (value_type (val));
+  bit_val = value::allocate (val->type ());
 
-  unpack_value_bitfield (bit_val,
-			 w->val_bitpos,
-			 w->val_bitsize,
-			 value_contents_for_printing (val).data (),
-			 value_offset (val),
-			 val);
+  val->unpack_bitfield (bit_val,
+			w->val_bitpos,
+			w->val_bitsize,
+			val->contents_for_printing ().data (),
+			val->offset ());
 
   return bit_val;
 }
@@ -2067,10 +2068,10 @@ update_watchpoint (struct watchpoint *b, bool reparse)
 	     must watch it.  If the first value returned is
 	     still lazy, that means an error occurred reading it;
 	     watch it anyway in case it becomes readable.  */
-	  if (VALUE_LVAL (v) == lval_memory
-	      && (v == val_chain[0] || ! value_lazy (v)))
+	  if (v->lval () == lval_memory
+	      && (v == val_chain[0] || ! v->lazy ()))
 	    {
-	      struct type *vtype = check_typedef (value_type (v));
+	      struct type *vtype = check_typedef (v->type ());
 
 	      /* We only watch structs and arrays if user asked
 		 for it explicitly, never if they just happen to
@@ -2084,12 +2085,12 @@ update_watchpoint (struct watchpoint *b, bool reparse)
 		  struct bp_location *loc, **tmp;
 		  int bitpos = 0, bitsize = 0;
 
-		  if (value_bitsize (v) != 0)
+		  if (v->bitsize () != 0)
 		    {
 		      /* Extract the bit parameters out from the bitfield
 			 sub-expression.  */
-		      bitpos = value_bitpos (v);
-		      bitsize = value_bitsize (v);
+		      bitpos = v->bitpos ();
+		      bitsize = v->bitsize ();
 		    }
 		  else if (v == result && b->val_bitsize != 0)
 		    {
@@ -2100,7 +2101,7 @@ update_watchpoint (struct watchpoint *b, bool reparse)
 		      bitsize = b->val_bitsize;
 		    }
 
-		  addr = value_address (v);
+		  addr = v->address ();
 		  if (bitsize != 0)
 		    {
 		      /* Skip the bytes that don't contain the bitfield.  */
@@ -2117,7 +2118,7 @@ update_watchpoint (struct watchpoint *b, bool reparse)
 		  for (tmp = &(b->loc); *tmp != NULL; tmp = &((*tmp)->next))
 		    ;
 		  *tmp = loc;
-		  loc->gdbarch = value_type (v)->arch ();
+		  loc->gdbarch = v->type ()->arch ();
 
 		  loc->pspace = frame_pspace;
 		  loc->address
@@ -2129,12 +2130,27 @@ update_watchpoint (struct watchpoint *b, bool reparse)
 		      loc->length = ((bitpos % 8) + bitsize + 7) / 8;
 		    }
 		  else
-		    loc->length = value_type (v)->length ();
+		    loc->length = v->type ()->length ();
 
 		  loc->watchpoint_type = type;
 		}
 	    }
 	}
+
+      /* Helper function to bundle possibly emitting a warning along with
+	 changing the type of B to bp_watchpoint.  */
+      auto change_type_to_bp_watchpoint = [] (breakpoint *bp)
+      {
+	/* Only warn for breakpoints that have been assigned a +ve number,
+	   anything else is either an internal watchpoint (which we don't
+	   currently create) or has not yet been finalized, in which case
+	   this change of type will be occurring before the user is told
+	   the type of this watchpoint.  */
+	if (bp->type == bp_hardware_watchpoint && bp->number > 0)
+	  warning (_("watchpoint %d downgraded to software watchpoint"),
+		   bp->number);
+	bp->type = bp_watchpoint;
+      };
 
       /* Change the type of breakpoint between hardware assisted or
 	 an ordinary watchpoint depending on the hardware support and
@@ -2193,7 +2209,7 @@ update_watchpoint (struct watchpoint *b, bool reparse)
 			     "resources for this watchpoint."));
 
 		  /* Downgrade to software watchpoint.  */
-		  b->type = bp_watchpoint;
+		  change_type_to_bp_watchpoint (b);
 		}
 	      else
 		{
@@ -2214,7 +2230,7 @@ update_watchpoint (struct watchpoint *b, bool reparse)
 			 "read/access watchpoint."));
 	    }
 	  else
-	    b->type = bp_watchpoint;
+	    change_type_to_bp_watchpoint (b);
 
 	  loc_type = (b->type == bp_watchpoint? bp_loc_software_watchpoint
 		      : bp_loc_hardware_watchpoint);
@@ -2833,7 +2849,7 @@ insert_bp_location (struct bp_location *bl,
 		  if (val)
 		    bp_excpt = gdb_exception {RETURN_ERROR, GENERIC_ERROR};
 		}
-	      catch (gdb_exception &e)
+	      catch (gdb_exception_error &e)
 		{
 		  rethrow_on_target_close_error (e);
 		  bp_excpt = std::move (e);
@@ -2931,8 +2947,6 @@ insert_bp_location (struct bp_location *bl,
     }
 
   else if (bl->loc_type == bp_loc_hardware_watchpoint
-	   /* NOTE drow/2003-09-08: This state only exists for removing
-	      watchpoints.  It's not clear that it's necessary...  */
 	   && bl->owner->disposition != disp_del_at_next_stop)
     {
       int val;
@@ -3117,7 +3131,7 @@ update_inserted_breakpoint_locations (void)
   if (error_flag)
     {
       target_terminal::ours_for_output ();
-      error_stream (tmp_error_stream);
+      error (("%s"), tmp_error_stream.c_str ());
     }
 }
 
@@ -3214,7 +3228,7 @@ insert_breakpoint_locations (void)
 You may have requested too many hardware breakpoints/watchpoints.\n");
 	}
       target_terminal::ours_for_output ();
-      error_stream (tmp_error_stream);
+      error (("%s"), tmp_error_stream.c_str ());
     }
 }
 
@@ -3244,14 +3258,10 @@ remove_threaded_breakpoints (struct thread_info *tp, int silent)
     {
       if (b->thread == tp->global_num && user_breakpoint_p (b))
 	{
-	  b->disposition = disp_del_at_next_stop;
-
 	  gdb_printf (_("\
 Thread-specific breakpoint %d deleted - thread %s no longer in the thread list.\n"),
 		      b->number, print_thread_id (tp));
-
-	  /* Hide it from the user.  */
-	  b->number = 0;
+	  delete_breakpoint (b);
        }
     }
 }
@@ -4408,7 +4418,7 @@ bpstat::bpstat (const bpstat &other)
     print_it (other.print_it)
 {
   if (other.old_val != NULL)
-    old_val = release_value (value_copy (other.old_val.get ()));
+    old_val = release_value (other.old_val->copy ());
 }
 
 /* Return a copy of a bpstat.  Like "bs1 = bs2" but all storage that
@@ -4968,7 +4978,7 @@ static bool
 breakpoint_cond_eval (expression *exp)
 {
   scoped_value_mark mark;
-  return value_true (evaluate_expression (exp));
+  return value_true (exp->evaluate ());
 }
 
 /* Allocate a new bpstat.  Link it to the FIFO list by BS_LINK_POINTER.  */
@@ -5142,7 +5152,7 @@ watchpoint_check (bpstat *bs)
 
 	  function = get_frame_function (fr);
 	  if (function == NULL
-	      || !contained_in (b->exp_valid_block, function->value_block ()))
+	      || !function->value_block ()->contains (b->exp_valid_block))
 	    within_current_scope = false;
 	}
 
@@ -5295,7 +5305,7 @@ bpstat_check_watchpoint (bpstat *bs)
 	    {
 	      e = watchpoint_check (bs);
 	    }
-	  catch (const gdb_exception &ex)
+	  catch (const gdb_exception_error &ex)
 	    {
 	      exception_fprintf (gdb_stderr, ex,
 				 "Error evaluating expression "
@@ -5465,7 +5475,7 @@ bpstat_check_breakpoint_conditions (bpstat *bs, thread_info *thread)
      evaluating the condition if this isn't the specified
      thread/task.  */
   if ((b->thread != -1 && b->thread != thread->global_num)
-      || (b->task != 0 && b->task != ada_get_task_number (thread)))
+      || (b->task != -1 && b->task != ada_get_task_number (thread)))
     {
       infrun_debug_printf ("incorrect thread or task, not stopping");
       bs->stop = false;
@@ -5533,16 +5543,29 @@ bpstat_check_breakpoint_conditions (bpstat *bs, thread_info *thread)
 	  else
 	    within_current_scope = false;
 	}
+      CORE_ADDR pc_before_check = get_frame_pc (get_selected_frame (nullptr));
       if (within_current_scope)
 	{
 	  try
 	    {
 	      condition_result = breakpoint_cond_eval (cond);
 	    }
-	  catch (const gdb_exception &ex)
+	  catch (const gdb_exception_error &ex)
 	    {
 	      exception_fprintf (gdb_stderr, ex,
-				 "Error in testing breakpoint condition:\n");
+				 "Error in testing condition for breakpoint %d:\n",
+				 b->number);
+
+	      /* If the pc value changed as a result of evaluating the
+		 condition then we probably stopped within an inferior
+		 function call due to some unexpected stop, e.g. the thread
+		 hit another breakpoint, or the thread received an
+		 unexpected signal.  In this case we don't want to also
+		 print the information about this breakpoint.  */
+	      CORE_ADDR pc_after_check
+		= get_frame_pc (get_selected_frame (nullptr));
+	      if (pc_before_check != pc_after_check)
+		bs->print = 0;
 	    }
 	}
       else
@@ -6375,7 +6398,7 @@ print_one_breakpoint_location (struct breakpoint *b,
 	 without a footnote.  On the CLI, for enabled locations whose
 	 breakpoint is disabled, display "y-".  */
       auto get_enable_state = [uiout, loc] () -> const char *
-        {
+	{
 	  if (uiout->is_mi_like_p ())
 	    {
 	      if (loc->disabled_by_cond)
@@ -6455,33 +6478,32 @@ print_one_breakpoint_location (struct breakpoint *b,
 	    inf_nums.push_back (inf->num);
 	}
 
-	/* For backward compatibility, don't display inferiors in CLI unless
-	   there are several.  Always display for MI. */
-	if (allflag
-	    || (!gdbarch_has_global_breakpoints (target_gdbarch ())
-		&& (program_spaces.size () > 1
-		    || number_of_inferiors () > 1)
-		/* LOC is for existing B, it cannot be in
-		   moribund_locations and thus having NULL OWNER.  */
-		&& loc->owner->type != bp_catchpoint))
+      /* For backward compatibility, don't display inferiors in CLI unless
+	 there are several.  Always display for MI. */
+      if (allflag
+	  || (!gdbarch_has_global_breakpoints (target_gdbarch ())
+	      && (program_spaces.size () > 1
+		  || number_of_inferiors () > 1)
+	      /* LOC is for existing B, it cannot be in
+		 moribund_locations and thus having NULL OWNER.  */
+	      && loc->owner->type != bp_catchpoint))
 	mi_only = 0;
       output_thread_groups (uiout, "thread-groups", inf_nums, mi_only);
     }
 
-  if (!part_of_multiple)
+  /* In the MI output, each location of a thread or task specific
+     breakpoint includes the relevant thread or task ID.  This is done for
+     backwards compatibility reasons.
+
+     For the CLI output, the thread/task information is printed on a
+     separate line, see the 'stop only in thread' and 'stop only in task'
+     output below.  */
+  if (part_of_multiple && uiout->is_mi_like_p ())
     {
       if (b->thread != -1)
-	{
-	  /* FIXME: This seems to be redundant and lost here; see the
-	     "stop only in" line a little further down.  */
-	  uiout->text (" thread ");
-	  uiout->field_signed ("thread", b->thread);
-	}
-      else if (b->task != 0)
-	{
-	  uiout->text (" task ");
-	  uiout->field_signed ("task", b->task);
-	}
+	uiout->field_signed ("thread", b->thread);
+      else if (b->task != -1)
+	uiout->field_signed ("task", b->task);
     }
 
   uiout->text ("\n");
@@ -6536,7 +6558,14 @@ print_one_breakpoint_location (struct breakpoint *b,
 	}
       uiout->text ("\n");
     }
-  
+
+  if (!part_of_multiple && b->task != -1)
+    {
+      uiout->text ("\tstop only in task ");
+      uiout->field_signed ("task", b->task);
+      uiout->text ("\n");
+    }
+
   if (!part_of_multiple)
     {
       if (b->hit_count)
@@ -6606,7 +6635,7 @@ print_one_breakpoint_location (struct breakpoint *b,
 
       bool use_fixed_output =
 	(uiout->test_flags (fix_breakpoint_script_output)
-         || fix_breakpoint_script_output_globally);
+	 || fix_breakpoint_script_output_globally);
 
       gdb::optional<ui_out_emit_tuple> tuple_emitter;
       gdb::optional<ui_out_emit_list> list_emitter;
@@ -7039,7 +7068,12 @@ describe_other_breakpoints (struct gdbarch *gdbarch,
 	    if (b->thread == -1 && thread != -1)
 	      gdb_printf (" (all threads)");
 	    else if (b->thread != -1)
-	      gdb_printf (" (thread %d)", b->thread);
+	      {
+		struct thread_info *thr = find_thread_global_id (b->thread);
+		gdb_printf (" (thread %s)", print_thread_id (thr));
+	      }
+	    else if (b->task != -1)
+	      gdb_printf (" (task %d)", b->task);
 	    gdb_printf ("%s%s ",
 			((b->enable_state == bp_disabled
 			  || b->enable_state == bp_call_disabled)
@@ -7347,20 +7381,27 @@ bp_location_from_bp_type (bptype type)
     case bp_gnu_ifunc_resolver_return:
     case bp_dprintf:
       return bp_loc_software_breakpoint;
+
     case bp_hardware_breakpoint:
       return bp_loc_hardware_breakpoint;
+
     case bp_hardware_watchpoint:
     case bp_read_watchpoint:
     case bp_access_watchpoint:
       return bp_loc_hardware_watchpoint;
+
     case bp_watchpoint:
       return bp_loc_software_watchpoint;
-    case bp_catchpoint:
+
     case bp_tracepoint:
     case bp_fast_tracepoint:
     case bp_static_tracepoint:
     case bp_static_marker_tracepoint:
+      return bp_loc_tracepoint;
+
+    case bp_catchpoint:
       return bp_loc_other;
+
     default:
       internal_error (_("unknown breakpoint type"));
     }
@@ -7569,72 +7610,79 @@ set_longjmp_breakpoint_for_call_dummy (void)
 void
 check_longjmp_breakpoint_for_call_dummy (struct thread_info *tp)
 {
-  struct breakpoint *b, *b_tmp;
+  /* We would need to delete breakpoints other than the current one while
+     iterating, so all_breakpoints_safe is not sufficient to make that safe.
+     Save all breakpoints to delete in that set and delete them at the end.  */
+  std::unordered_set<breakpoint *> to_delete;
 
-  ALL_BREAKPOINTS_SAFE (b, b_tmp)
-    if (b->type == bp_longjmp_call_dummy && b->thread == tp->global_num)
-      {
-	struct breakpoint *dummy_b = b->related_breakpoint;
+  for (struct breakpoint *b : all_breakpoints ())
+    {
+      if (b->type == bp_longjmp_call_dummy && b->thread == tp->global_num)
+	{
+	  struct breakpoint *dummy_b = b->related_breakpoint;
 
-	/* Find the bp_call_dummy breakpoint in the list of breakpoints
-	   chained off b->related_breakpoint.  */
-	while (dummy_b != b && dummy_b->type != bp_call_dummy)
-	  dummy_b = dummy_b->related_breakpoint;
+	  /* Find the bp_call_dummy breakpoint in the list of breakpoints
+	     chained off b->related_breakpoint.  */
+	  while (dummy_b != b && dummy_b->type != bp_call_dummy)
+	    dummy_b = dummy_b->related_breakpoint;
 
-	/* If there was no bp_call_dummy breakpoint then there's nothing
-	   more to do.  Or, if the dummy frame associated with the
-	   bp_call_dummy is still on the stack then we need to leave this
-	   bp_call_dummy in place.  */
-	if (dummy_b->type != bp_call_dummy
-	    || frame_find_by_id (dummy_b->frame_id) != NULL)
-	  continue;
+	  /* If there was no bp_call_dummy breakpoint then there's nothing
+	     more to do.  Or, if the dummy frame associated with the
+	     bp_call_dummy is still on the stack then we need to leave this
+	     bp_call_dummy in place.  */
+	  if (dummy_b->type != bp_call_dummy
+	      || frame_find_by_id (dummy_b->frame_id) != NULL)
+	    continue;
 
-	/* We didn't find the dummy frame on the stack, this could be
-	   because we have longjmp'd to a stack frame that is previous to
-	   the dummy frame, or it could be because the stack unwind is
-	   broken at some point between the longjmp frame and the dummy
-	   frame.
+	  /* We didn't find the dummy frame on the stack, this could be
+	     because we have longjmp'd to a stack frame that is previous to
+	     the dummy frame, or it could be because the stack unwind is
+	     broken at some point between the longjmp frame and the dummy
+	     frame.
 
-	   Next we figure out why the stack unwind stopped.  If it looks
-	   like the unwind is complete then we assume the dummy frame has
-	   been jumped over, however, if the unwind stopped for an
-	   unexpected reason then we assume the stack unwind is currently
-	   broken, and that we will (eventually) return to the dummy
-	   frame.
+	     Next we figure out why the stack unwind stopped.  If it looks
+	     like the unwind is complete then we assume the dummy frame has
+	     been jumped over, however, if the unwind stopped for an
+	     unexpected reason then we assume the stack unwind is currently
+	     broken, and that we will (eventually) return to the dummy
+	     frame.
 
-	   It might be tempting to consider using frame_id_inner here, but
-	   that is not safe.   There is no guarantee that the stack frames
-	   we are looking at here are even on the same stack as the
-	   original dummy frame, hence frame_id_inner can't be used.  See
-	   the comments on frame_id_inner for more details.  */
-	bool unwind_finished_unexpectedly = false;
-	for (frame_info_ptr fi = get_current_frame (); fi != nullptr; )
-	  {
-	    frame_info_ptr prev = get_prev_frame (fi);
-	    if (prev == nullptr)
-	      {
-		/* FI is the last stack frame.  Why did this frame not
-		   unwind further?  */
-		auto stop_reason = get_frame_unwind_stop_reason (fi);
-		if (stop_reason != UNWIND_NO_REASON
-		    && stop_reason != UNWIND_OUTERMOST)
-		  unwind_finished_unexpectedly = true;
-	      }
-	    fi = prev;
-	  }
-	if (unwind_finished_unexpectedly)
-	  continue;
+	     It might be tempting to consider using frame_id_inner here, but
+	     that is not safe.   There is no guarantee that the stack frames
+	     we are looking at here are even on the same stack as the
+	     original dummy frame, hence frame_id_inner can't be used.  See
+	     the comments on frame_id_inner for more details.  */
+	  bool unwind_finished_unexpectedly = false;
+	  for (frame_info_ptr fi = get_current_frame (); fi != nullptr; )
+	    {
+	      frame_info_ptr prev = get_prev_frame (fi);
+	      if (prev == nullptr)
+		{
+		  /* FI is the last stack frame.  Why did this frame not
+		     unwind further?  */
+		  auto stop_reason = get_frame_unwind_stop_reason (fi);
+		  if (stop_reason != UNWIND_NO_REASON
+		      && stop_reason != UNWIND_OUTERMOST)
+		    unwind_finished_unexpectedly = true;
+		}
+	      fi = prev;
+	    }
+	  if (unwind_finished_unexpectedly)
+	    continue;
 
-	dummy_frame_discard (dummy_b->frame_id, tp);
+	  dummy_frame_discard (dummy_b->frame_id, tp);
 
-	while (b->related_breakpoint != b)
-	  {
-	    if (b_tmp == b->related_breakpoint)
-	      b_tmp = b->related_breakpoint->next;
-	    delete_breakpoint (b->related_breakpoint);
-	  }
-	delete_breakpoint (b);
-      }
+	  for (breakpoint *related_breakpoint = b->related_breakpoint;
+	       related_breakpoint != b;
+	       related_breakpoint = related_breakpoint->related_breakpoint)
+	    to_delete.insert (b->related_breakpoint);
+
+	  to_delete.insert (b);
+	}
+    }
+
+  for (breakpoint *b : to_delete)
+    delete_breakpoint (b);
 }
 
 void
@@ -8432,6 +8480,8 @@ code_breakpoint::code_breakpoint (struct gdbarch *gdbarch_,
 
   gdb_assert (!sals.empty ());
 
+  /* At most one of thread or task can be set on any breakpoint.  */
+  gdb_assert (thread == -1 || task == -1);
   thread = thread_;
   task = task_;
 
@@ -8747,7 +8797,7 @@ find_condition_and_thread (const char *tok, CORE_ADDR pc,
 {
   cond_string->reset ();
   *thread = -1;
-  *task = 0;
+  *task = -1;
   rest->reset ();
   bool force = false;
 
@@ -8797,6 +8847,12 @@ find_condition_and_thread (const char *tok, CORE_ADDR pc,
 	  const char *tmptok;
 	  struct thread_info *thr;
 
+	  if (*thread != -1)
+	    error(_("You can specify only one thread."));
+
+	  if (*task != -1)
+	    error (_("You can specify only one of thread or task."));
+
 	  tok = end_tok + 1;
 	  thr = parse_thread_id (tok, &tmptok);
 	  if (tok == tmptok)
@@ -8807,6 +8863,12 @@ find_condition_and_thread (const char *tok, CORE_ADDR pc,
       else if (toklen >= 1 && strncmp (tok, "task", toklen) == 0)
 	{
 	  char *tmptok;
+
+	  if (*task != -1)
+	    error(_("You can specify only one task."));
+
+	  if (*thread != -1)
+	    error (_("You can specify only one of thread or task."));
 
 	  tok = end_tok + 1;
 	  *task = strtol (tok, &tmptok, 0);
@@ -8842,8 +8904,8 @@ find_condition_and_thread_for_sals (const std::vector<symtab_and_line> &sals,
   for (auto &sal : sals)
     {
       gdb::unique_xmalloc_ptr<char> cond;
-      int thread_id = 0;
-      int task_id = 0;
+      int thread_id = -1;
+      int task_id = -1;
       gdb::unique_xmalloc_ptr<char> remaining;
 
       /* Here we want to parse 'arg' to separate condition from thread
@@ -8857,6 +8919,8 @@ find_condition_and_thread_for_sals (const std::vector<symtab_and_line> &sals,
 	  find_condition_and_thread (input, sal.pc, &cond, &thread_id,
 				     &task_id, &remaining);
 	  *cond_string = std::move (cond);
+	  /* At most one of thread or task can be set.  */
+	  gdb_assert (thread_id == -1 || task_id == -1);
 	  *thread = thread_id;
 	  *task = task_id;
 	  *rest = std::move (remaining);
@@ -8958,7 +9022,7 @@ create_breakpoint (struct gdbarch *gdbarch,
 {
   struct linespec_result canonical;
   bool pending = false;
-  int task = 0;
+  int task = -1;
   int prev_bkpt_count = breakpoint_count;
 
   gdb_assert (ops != NULL);
@@ -9196,13 +9260,10 @@ resolve_sal_pc (struct symtab_and_line *sal)
 				    sal->symtab->compunit ());
       if (bv != NULL)
 	{
-	  sym = block_linkage_function (b);
+	  sym = b->linkage_function ();
 	  if (sym != NULL)
-	    {
-	      fixup_symbol_section (sym, sal->symtab->compunit ()->objfile ());
-	      sal->section
-		= sym->obj_section (sal->symtab->compunit ()->objfile ());
-	    }
+	    sal->section
+	      = sym->obj_section (sal->symtab->compunit ()->objfile ());
 	  else
 	    {
 	      /* It really is worthwhile to have the section, so we'll
@@ -10030,7 +10091,7 @@ watch_command_1 (const char *arg, int accessflag, int from_tty,
      the hardware watchpoint.  */
   bool use_mask = false;
   CORE_ADDR mask = 0;
-  int task = 0;
+  int task = -1;
 
   /* Make sure that we actually have parameters to parse.  */
   if (arg != NULL && arg[0] != '\0')
@@ -10077,6 +10138,9 @@ watch_command_1 (const char *arg, int accessflag, int from_tty,
 	      if (thread != -1)
 		error(_("You can specify only one thread."));
 
+	      if (task != -1)
+		error (_("You can specify only one of thread or task."));
+
 	      /* Extract the thread ID from the next token.  */
 	      thr = parse_thread_id (value_start, &endp);
 
@@ -10089,6 +10153,12 @@ watch_command_1 (const char *arg, int accessflag, int from_tty,
 	  else if (toklen == 4 && startswith (tok, "task"))
 	    {
 	      char *tmp;
+
+	      if (task != -1)
+		error(_("You can specify only one task."));
+
+	      if (thread != -1)
+		error (_("You can specify only one of thread or task."));
 
 	      task = strtol (value_start, &tmp, 0);
 	      if (tmp == value_start)
@@ -10157,8 +10227,8 @@ watch_command_1 (const char *arg, int accessflag, int from_tty,
 
   if (val_as_value != NULL && just_location)
     {
-      saved_bitpos = value_bitpos (val_as_value);
-      saved_bitsize = value_bitsize (val_as_value);
+      saved_bitpos = val_as_value->bitpos ();
+      saved_bitsize = val_as_value->bitsize ();
     }
 
   value_ref_ptr val;
@@ -10265,6 +10335,8 @@ watch_command_1 (const char *arg, int accessflag, int from_tty,
   else
     w.reset (new watchpoint (nullptr, bp_type));
 
+  /* At most one of thread or task can be set on a watchpoint.  */
+  gdb_assert (thread == -1 || task == -1);
   w->thread = thread;
   w->task = task;
   w->disposition = disp_donttouch;
@@ -10274,7 +10346,7 @@ watch_command_1 (const char *arg, int accessflag, int from_tty,
   w->cond_exp_valid_block = cond_exp_valid_block;
   if (just_location)
     {
-      struct type *t = value_type (val.get ());
+      struct type *t = val->type ();
       CORE_ADDR addr = value_as_address (val.get ());
 
       w->exp_string_reparse
@@ -10370,9 +10442,9 @@ can_use_hardware_watchpoint (const std::vector<value_ref_ptr> &vals)
     {
       struct value *v = iter.get ();
 
-      if (VALUE_LVAL (v) == lval_memory)
+      if (v->lval () == lval_memory)
 	{
-	  if (v != head && value_lazy (v))
+	  if (v != head && v->lazy ())
 	    /* A lazy memory lvalue in the chain is one that GDB never
 	       needed to fetch; we either just used its address (e.g.,
 	       `a' in `a.b') or we never needed it at all (e.g., `a'
@@ -10383,7 +10455,7 @@ can_use_hardware_watchpoint (const std::vector<value_ref_ptr> &vals)
 	    {
 	      /* Ahh, memory we actually used!  Check if we can cover
 		 it with hardware watchpoints.  */
-	      struct type *vtype = check_typedef (value_type (v));
+	      struct type *vtype = check_typedef (v->type ());
 
 	      /* We only watch structs and arrays if user asked for it
 		 explicitly, never if they just happen to appear in a
@@ -10392,13 +10464,13 @@ can_use_hardware_watchpoint (const std::vector<value_ref_ptr> &vals)
 		  || (vtype->code () != TYPE_CODE_STRUCT
 		      && vtype->code () != TYPE_CODE_ARRAY))
 		{
-		  CORE_ADDR vaddr = value_address (v);
+		  CORE_ADDR vaddr = v->address ();
 		  int len;
 		  int num_regs;
 
 		  len = (target_exact_watchpoints
 			 && is_scalar_type_recursive (vtype))?
-		    1 : value_type (v)->length ();
+		    1 : v->type ()->length ();
 
 		  num_regs = target_region_ok_for_hw_watchpoint (vaddr, len);
 		  if (!num_regs)
@@ -10408,10 +10480,9 @@ can_use_hardware_watchpoint (const std::vector<value_ref_ptr> &vals)
 		}
 	    }
 	}
-      else if (VALUE_LVAL (v) != not_lval
-	       && deprecated_value_modifiable (v) == 0)
+      else if (v->lval () != not_lval && !v->deprecated_modifiable ())
 	return 0;	/* These are values from the history (e.g., $1).  */
-      else if (VALUE_LVAL (v) == lval_register)
+      else if (v->lval () == lval_register)
 	return 0;	/* Cannot watch a register with a HW watchpoint.  */
     }
 
@@ -13477,7 +13548,7 @@ enable_breakpoint_disp (struct breakpoint *bpt, enum bpdisp disposition,
 	  bpt->enable_state = bp_enabled;
 	  update_watchpoint (w, true /* reparse */);
 	}
-      catch (const gdb_exception &e)
+      catch (const gdb_exception_error &e)
 	{
 	  bpt->enable_state = orig_enable_state;
 	  exception_fprintf (gdb_stderr, e, _("Cannot enable watchpoint %d: "),
@@ -14100,9 +14171,12 @@ void
 breakpoint::print_recreate_thread (struct ui_file *fp) const
 {
   if (thread != -1)
-    gdb_printf (fp, " thread %d", thread);
+    {
+      struct thread_info *thr = find_thread_global_id (thread);
+      gdb_printf (fp, " thread %s", print_full_thread_id (thr));
+    }
 
-  if (task != 0)
+  if (task != -1)
     gdb_printf (fp, " task %d", task);
 
   gdb_printf (fp, "\n");

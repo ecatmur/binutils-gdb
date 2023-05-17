@@ -35,7 +35,7 @@
 #include <ctype.h>
 #include "mi-parse.h"
 #include "gdbsupport/gdb_optional.h"
-#include "safe-ctype.h"
+#include "gdbsupport/gdb-safe-ctype.h"
 #include "inferior.h"
 #include "observable.h"
 
@@ -501,14 +501,13 @@ list_arg_or_local (const struct frame_arg *arg, enum what_to_list what,
 		  && (arg->val || arg->error)));
 
   if (skip_unavailable && arg->val != NULL
-      && (value_entirely_unavailable (arg->val)
+      && (arg->val->entirely_unavailable ()
 	  /* A scalar object that does not have all bits available is
 	     also considered unavailable, because all bits contribute
 	     to its representation.  */
-	  || (val_print_scalar_type_p (value_type (arg->val))
-	      && !value_bytes_available (arg->val,
-					 value_embedded_offset (arg->val),
-					 value_type (arg->val)->length ()))))
+	  || (val_print_scalar_type_p (arg->val->type ())
+	      && !arg->val->bytes_available (arg->val->embedded_offset (),
+					     arg->val->type ()->length ()))))
     return;
 
   gdb::optional<ui_out_emit_tuple> tuple_emitter;
@@ -569,8 +568,6 @@ list_args_or_locals (const frame_print_options &fp_opts,
 		     frame_info_ptr fi, int skip_unavailable)
 {
   const struct block *block;
-  struct symbol *sym;
-  struct block_iterator iter;
   const char *name_of_result;
   struct ui_out *uiout = current_uiout;
 
@@ -595,7 +592,7 @@ list_args_or_locals (const frame_print_options &fp_opts,
 
   while (block != 0)
     {
-      ALL_BLOCK_SYMBOLS (block, iter, sym)
+      for (struct symbol *sym : block_iterator_range (block))
 	{
 	  int print_me = 0;
 
@@ -648,13 +645,8 @@ list_args_or_locals (const frame_print_options &fp_opts,
 	      switch (values)
 		{
 		case PRINT_SIMPLE_VALUES:
-		  {
-		    struct type *type = check_typedef (sym2->type ());
-		    if (type->code () == TYPE_CODE_ARRAY
-			|| type->code () == TYPE_CODE_STRUCT
-			|| type->code () == TYPE_CODE_UNION)
-		      break;
-		  }
+		  if (!mi_simple_type_p (sym2->type ()))
+		    break;
 		  /* FALLTHROUGH */
 
 		case PRINT_ALL_VALUES:

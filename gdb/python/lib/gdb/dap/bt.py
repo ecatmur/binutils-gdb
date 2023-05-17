@@ -1,4 +1,4 @@
-# Copyright 2022 Free Software Foundation, Inc.
+# Copyright 2022-2023 Free Software Foundation, Inc.
 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -69,7 +69,7 @@ def _backtrace(thread_id, levels, startFrame):
                 "instructionPointerReference": hex(current_frame.pc()),
             }
             sal = _safe_sal(current_frame)
-            if sal is not None:
+            if sal is not None and sal.symtab is not None:
                 newframe["source"] = {
                     "name": os.path.basename(sal.symtab.filename),
                     "path": sal.symtab.filename,

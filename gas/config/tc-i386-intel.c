@@ -320,8 +320,10 @@ i386_intel_simplify_register (expressionS *e)
 	  as_bad (_("invalid use of register"));
 	  return 0;
 	}
-      if (i386_regtab[reg_num].reg_type.bitfield.class == SReg
-	  && i386_regtab[reg_num].reg_num == RegFlat)
+      if ((i386_regtab[reg_num].reg_type.bitfield.class == SReg
+	   && i386_regtab[reg_num].reg_num == RegFlat)
+	  || (dot_insn ()
+	      && i386_regtab[reg_num].reg_type.bitfield.class == ClassNone))
 	{
 	  as_bad (_("invalid use of pseudo-register"));
 	  return 0;
@@ -342,6 +344,7 @@ i386_intel_simplify_register (expressionS *e)
 
       if (intel_state.in_scale
 	  || i386_regtab[reg_num].reg_type.bitfield.baseindex
+	  || dot_insn ()
 	  || t->mnem_off == MN_bndmk
 	  || t->mnem_off == MN_bndldx
 	  || t->mnem_off == MN_bndstx)
@@ -694,7 +697,8 @@ i386_intel_operand (char *operand_string, int got_a_float)
 	  if (got_a_float == 2)	/* "fi..." */
 	    suffix = SHORT_MNEM_SUFFIX;
 	  else if (current_templates->start->mnem_off != MN_lar
-		   && current_templates->start->mnem_off != MN_lsl)
+		   && current_templates->start->mnem_off != MN_lsl
+		   && current_templates->start->mnem_off != MN_arpl)
 	    suffix = WORD_MNEM_SUFFIX;
 	  break;
 
@@ -961,7 +965,8 @@ i386_intel_operand (char *operand_string, int got_a_float)
       i386_operand_type temp;
 
       /* Register operand.  */
-      if (intel_state.base || intel_state.index || intel_state.seg)
+      if (intel_state.base || intel_state.index || intel_state.seg
+          || i.imm_bits[this_operand])
 	{
 	  as_bad (_("invalid operand"));
 	  return 0;
@@ -994,6 +999,12 @@ i386_intel_operand (char *operand_string, int got_a_float)
 	   || intel_state.is_mem)
     {
       /* Memory operand.  */
+      if (i.imm_bits[this_operand])
+	{
+	  as_bad (_("invalid operand"));
+	  return 0;
+	}
+
       if (i.mem_operands)
 	{
 	  /* Handle

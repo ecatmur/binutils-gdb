@@ -225,8 +225,6 @@ extern void post_create_inferior (int from_tty);
 
 extern void attach_command (const char *, int);
 
-extern void set_inferior_args_vector (int, char **);
-
 extern void registers_info (const char *, int);
 
 extern void continue_1 (int all_threads);
@@ -340,12 +338,19 @@ extern void set_current_inferior (inferior *);
    selected.  */
 extern void switch_to_inferior_no_thread (inferior *inf);
 
+/* Ensure INF is the current inferior.
+
+   If the current inferior was changed, return an RAII object that will
+   restore the original current context.  */
+extern gdb::optional<scoped_restore_current_thread> maybe_switch_inferior
+  (inferior *inf);
+
 /* Info about an inferior's target description.  There's one of these
    for each inferior.  */
 
 struct target_desc_info
 {
-  /* Returns true if INFO indicates the target description had been supplied by
+  /* Returns true if this target description information has been supplied by
      the user.  */
   bool from_user_p ()
   { return !this->filename.empty (); }
@@ -490,6 +495,9 @@ public:
   inline safe_inf_threads_range threads_safe ()
   { return safe_inf_threads_range (this->thread_list.begin ()); }
 
+  /* Find (non-exited) thread PTID of this inferior.  */
+  thread_info *find_thread (ptid_t ptid);
+
   /* Delete all threads in the thread list.  If SILENT, exit threads
      silently.  */
   void clear_thread_list (bool silent);
@@ -519,6 +527,9 @@ public:
   {
     m_args = std::move (args);
   };
+
+  /* Set the argument string from some strings.  */
+  void set_args (gdb::array_view<char * const> args);
 
   /* Get the argument string to use when running this inferior.
 

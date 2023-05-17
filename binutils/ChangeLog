@@ -1,3 +1,77 @@
+2023-05-09  Enze Li  <enze.li@gmx.com>
+
+	* README:  Correct a typo.
+
+2023-05-02  Nick Clifton  <nickc@redhat.com>
+
+	* MAINTAINERS: Remove Dimity Diky as MSP430 maintainer.
+
+2023-04-20  Nick Clifton  <nickc@redhat.com>
+
+	* SECURITY.txt: New file.
+
+2023-04-19  Nick Clifton  <nickc@redhat.com>
+
+	PR 30355
+	* dwarf.c (read_and_display_attr_value): Correctly handle
+	DW_loclistx attributes that index a version 5 .debug_loclists
+	section.
+
+2023-04-17  Nick Clifton  <nickc@redhat.com>
+
+	PR 30142
+	* rescoff.c (write_coff_file): Add the SEC_READONLY flag to the
+	.rsrc section.
+
+2023-04-11  Nick Clifton  <nickc@redhat.com>
+
+	PR 30327
+	* dwarf.c (read_and_display_attr_value): Warn if the number of
+	views is greater than the number of locations.
+
+	PR 30313
+	* dwarf.c (display_debug_lines_decoded): Check for an overlarge
+	number of files or directories.
+
+	PR 30312
+	* dwarf.c (prealloc_cu_tu_list): Always allocate at least one
+	entry.
+
+	PR 30311
+	* readelf.c (uncompress_section_contents): Check for a
+	suspiciously large uncompressed size.
+
+2023-03-30  Nick Clifton  <nickc@redhat.com>
+
+	PR 30284
+	* dwarf.c (read_and_display_attr_value): Detect and ignore
+	negative base values.
+
+2023-03-23  Frederic Cambus  <fred@statdns.com>
+
+	* readelf.c (get_segment_type): Handle PT_OPENBSD_MUTABLE segment
+	type.
+
+2023-03-14  Nick Clifton  <nickc@redhat.com>
+
+	PR 30227
+	* dwarf.c (process_cu_tu_index): Prevent excessive memory
+	allocation when nused is large and ncols is zero.
+
+2023-02-09  Tom Tromey  <tromey@adacore.com>
+
+	* dwarf-mode.el: Bump version to 1.8.
+	(dwarf-insert-substructure): Tighten regexp.
+	(dwarf-refresh-all): New defun.
+	(dwarf-mode-map): Bind "A" to dwarf-refresh-all.
+	(dwarf-mode): Remove old FIXME.
+
+2023-02-07  Nick Clifton  <nickc@redhat.com>
+
+	PR 30080
+	* doc/binutils.texi (nm): Update description of the 'n' symbol
+	type.
+
 2023-01-31  Nick Clifton  <nickc@redhat.com>
 
 	* po/sv.po: Updated Swedish translation.

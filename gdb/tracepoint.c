@@ -1375,8 +1375,8 @@ encode_actions_1 (struct command_line *action,
 		    case UNOP_MEMVAL:
 		      {
 			/* Safe because we know it's a simple expression.  */
-			tempval = evaluate_expression (exp.get ());
-			addr = value_address (tempval);
+			tempval = exp->evaluate ();
+			addr = tempval->address ();
 			expr::unop_memval_operation *memop
 			  = (gdb::checked_static_cast<expr::unop_memval_operation *>
 			     (exp->op.get ()));
@@ -2459,12 +2459,10 @@ tfind_outside_command (const char *args, int from_tty)
 static void
 info_scope_command (const char *args_in, int from_tty)
 {
-  struct symbol *sym;
   struct bound_minimal_symbol msym;
   const struct block *block;
   const char *symname;
   const char *save_args = args_in;
-  struct block_iterator iter;
   int j, count = 0;
   struct gdbarch *gdbarch;
   int regno;
@@ -2492,7 +2490,7 @@ info_scope_command (const char *args_in, int from_tty)
   while (block != 0)
     {
       QUIT;			/* Allow user to bail out with ^C.  */
-      ALL_BLOCK_SYMBOLS (block, iter, sym)
+      for (struct symbol *sym : block_iterator_range (block))
 	{
 	  QUIT;			/* Allow user to bail out with ^C.  */
 	  if (count == 0)
@@ -3777,12 +3775,12 @@ sdata_make_value (struct gdbarch *gdbarch, struct internalvar *var,
 
       type = init_vector_type (builtin_type (gdbarch)->builtin_true_char,
 			       buf->size ());
-      v = allocate_value (type);
-      memcpy (value_contents_raw (v).data (), buf->data (), buf->size ());
+      v = value::allocate (type);
+      memcpy (v->contents_raw ().data (), buf->data (), buf->size ());
       return v;
     }
   else
-    return allocate_value (builtin_type (gdbarch)->builtin_void);
+    return value::allocate (builtin_type (gdbarch)->builtin_void);
 }
 
 #if !defined(HAVE_LIBEXPAT)

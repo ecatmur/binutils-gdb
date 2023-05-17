@@ -139,15 +139,19 @@ coff_amd64_reloc (bfd *abfd,
 	  break;
 	case bfd_target_elf_flavour:
 	  /* Subtract __ImageBase.  */
+	  h = NULL;
 	  link_info = _bfd_get_link_info (obfd);
-	  if (link_info == NULL)
-	    return bfd_reloc_dangerous;
-	  h = bfd_link_hash_lookup (link_info->hash, "__ImageBase",
-				    false, false, false);
-	  if (h == NULL)
-	    return bfd_reloc_dangerous;
-	  while (h->type == bfd_link_hash_indirect)
-	    h = h->u.i.link;
+	  if (link_info != NULL)
+	    h = bfd_link_hash_lookup (link_info->hash, "__ImageBase",
+				      false, false, true);
+	  if (h == NULL
+	      || (h->type != bfd_link_hash_defined
+		  && h->type != bfd_link_hash_defweak))
+	    {
+	      *error_message
+		= (char *) _("R_AMD64_IMAGEBASE with __ImageBase undefined");
+	      return bfd_reloc_dangerous;
+	    }
 	  /* ELF symbols in relocatable files are section relative,
 	     but in nonrelocatable files they are virtual addresses.  */
 	  diff -= (h->u.def.value
@@ -741,22 +745,37 @@ coff_amd64_rtype_to_howto (bfd *abfd ATTRIBUTE_UNUSED,
 
   if (rel->r_type == R_AMD64_SECREL)
     {
-      bfd_vma osect_vma;
+      bfd_vma osect_vma = 0;
 
-      if (h && (h->root.type == bfd_link_hash_defined
-		|| h->root.type == bfd_link_hash_defweak))
+      if (h != NULL
+	  && (h->root.type == bfd_link_hash_defined
+	      || h->root.type == bfd_link_hash_defweak))
 	osect_vma = h->root.u.def.section->output_section->vma;
       else
 	{
+	  htab_t table = coff_data (abfd)->section_by_index;
 	  asection *s;
-	  int i;
 
-	  /* Sigh, the only way to get the section to offset against
-	     is to find it the hard way.  */
-	  for (s = abfd->sections, i = 1; i < sym->n_scnum; i++)
-	    s = s->next;
+	  if (htab_elements (table) == 0)
+	    {
+	      /* Sigh - if we do not have a section index then the only way
+		 to get the section to offset against is to find it the hard
+		 way.  */
+	      for (s = abfd->sections; s != NULL; s = s->next)
+		{
+		  void ** slot = htab_find_slot (table, s, INSERT);
 
-	  osect_vma = s->output_section->vma;
+		  if (slot != NULL)
+		    *slot = s;
+		}
+	    }
+
+	  struct bfd_section needle;
+
+	  needle.index = sym->n_scnum - 1;
+	  s = htab_find (table, &needle);
+	  if (s != NULL)
+	    osect_vma = s->output_section->vma;
 	}
 
       *addendp -= osect_vma;
